@@ -34,6 +34,83 @@ function Ensure-Storage {
         "Id,Date,Sport,DurationMin,Calories,DistanceKm,RPE,AvgHR,Note" | Out-File -Encoding utf8 -FilePath $LogPath
     }
 }
+
+# ------------------------------
+# Storage / paths (always set)
+# ------------------------------
+$script:AppName = "TrainingLoggerPro"
+$script:DataDir = Join-Path $env:APPDATA $script:AppName
+if (-not (Test-Path $script:DataDir)) { New-Item -ItemType Directory -Path $script:DataDir -Force | Out-Null }
+$script:EntriesFile  = Join-Path $script:DataDir "entries.json"
+$script:PrsFile      = Join-Path $script:DataDir "prs.json"
+$script:SettingsFile = Join-Path $script:DataDir "settings.json"
+
+# Simple in-memory cache
+$script:EntriesCache = $null
+function Get-EntriesCached {
+    param([switch]$Force)
+    if ($Force -or -not $script:EntriesCache) { $script:EntriesCache = Load-Entries }
+    return $script:EntriesCache
+}
+
+# ------------------------------
+# "AI" feedback (fast + local)
+# ------------------------------
+function New-OllamaStyleFeedback {
+    param(
+        [Parameter(Mandatory)]$Summary,
+        [Parameter()]$Entries
+    )
+
+    $rng = New-Object System.Random
+
+    $wins = @(
+        "Consistency looks solid — keep the streak going.",
+        "Good balance between endurance and strength this week.",
+        "Nice volume — you handled it well overall.",
+        "Good discipline on the basics: you showed up and got it done."
+    )
+
+    $risks = @(
+        "Your average effort looks high — add 1–2 genuinely easy days next week.",
+        "Watch recovery: prioritise sleep + hydration and keep at least one day very light.",
+        "If you feel niggles, cut intensity first and keep the easy volume."
+    )
+
+    $focus = @(
+        "1 long easy session + 1 quality session + 2 strength sessions (full body).",
+        "2 easy aerobic sessions + 1 controlled tempo/interval + 2 strength sessions.",
+        "Keep it simple: 1 long easy, 2 short easy, 1 quality, 2 strength."
+    )
+
+    $micro = @(
+        "Warm-up: 8–12 min easy + 3 strides. Cool-down: 5–10 min easy.",
+        "For strength, leave 1–2 reps in reserve on most sets (don’t grind).",
+        "Keep most running in Z2; save the hard work for one key session."
+    )
+
+    $period = if ($Summary.Period) { $Summary.Period } else { (Get-Date).ToString("yyyy-MM-dd") }
+    $s = @()
+    $s += "Ollama Coach Feedback"
+    $s += ""
+    $s += "Period: $period"
+    $s += ""
+    $s += "Key wins:"
+    $s += "- " + $wins[$rng.Next($wins.Count)]
+    $s += "- " + $wins[$rng.Next($wins.Count)]
+    $s += ""
+    $s += "What to improve next week:"
+    $s += "- " + $risks[$rng.Next($risks.Count)]
+    $s += "- " + $micro[$rng.Next($micro.Count)]
+    $s += ""
+    $s += "Suggested focus:"
+    $s += "- " + $focus[$rng.Next($focus.Count)]
+    $s += ""
+    $s += "Next step:"
+    $s += "- Pick 2–3 priorities, keep everything else easy, and reassess in 7 days."
+
+    return ($s -join "`r`n")
+}
 function Backup-Log {
     Ensure-Storage
     $stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
@@ -103,7 +180,7 @@ function Get-LoadForEntry($e) {
 function Get-DailyLoad($entries) {
     $entries | Group-Object { $_.DateObj } | ForEach-Object {
         [pscustomobject]@{
-            Date     = [datetime]$_.Name
+            Date     = $_.Group[0].DateObj
             Load     = ($_.Group | ForEach-Object { Get-LoadForEntry $_ } | Measure-Object -Sum).Sum
             Minutes  = ($_.Group | Measure-Object DurationMin -Sum).Sum
             Sessions = $_.Count
@@ -118,17 +195,122 @@ function Get-WeekStart([datetime]$d) {
 }
 
 # ----------------------------
+# PRs (manual + computed)
+# ----------------------------
+$script:PrsFile = Join-Path $BaseDir "prs.json"
+
+function ConvertTo-DataTable {
+    param(
+        [Parameter(Mandatory=$true)][object[]]$Items
+    )
+    $dt = New-Object System.Data.DataTable
+    if (-not $Items -or $Items.Count -eq 0) { return $dt }
+
+    # Build columns from first object
+    $first = $Items[0]
+    $props = @()
+    if ($first -is [hashtable]) {
+        $props = $first.Keys
+    } else {
+        $props = ($first | Get-Member -MemberType NoteProperty,Property | Select-Object -ExpandProperty Name)
+    }
+    foreach ($p in $props) { [void]$dt.Columns.Add($p) }
+
+    foreach ($it in $Items) {
+        $row = $dt.NewRow()
+        foreach ($p in $props) {
+            try {
+                $val = if ($it -is [hashtable]) { $it[$p] } else { $it.$p }
+                $row[$p] = if ($null -eq $val) { "" } else { "$val" }
+            } catch {
+                $row[$p] = ""
+            }
+        }
+        [void]$dt.Rows.Add($row)
+    }
+    return $dt
+}
+
+function Load-ManualPRs {
+    Ensure-Storage
+    if (-not (Test-Path $script:PrsFile)) { return @() }
+    try {
+        $j = Get-Content $script:PrsFile -Raw | ConvertFrom-Json
+        if ($null -eq $j) { return @() }
+        return @($j)
+    } catch { return @() }
+}
+
+function Save-ManualPRs([object[]]$prs) {
+    Ensure-Storage
+    $prs | ConvertTo-Json -Depth 6 | Out-File -Encoding utf8 -FilePath $script:PrsFile
+}
+
+function Get-ComputedPRs {
+    param([object[]]$Entries)
+    if (-not $Entries -or $Entries.Count -eq 0) { return @() }
+
+    $prs = New-Object System.Collections.Generic.List[object]
+
+    # General
+    $longest = $Entries | Sort-Object DurationMin -Descending | Select-Object -First 1
+    if ($longest) {
+        $prs.Add([pscustomobject]@{ Type='Longest session'; Sport=$longest.Sport; Value="{0} min" -f $longest.DurationMin; Date=$longest.Date; Note=($longest.Note ?? '') })
+    }
+    $highest = $Entries | Sort-Object { Get-LoadForEntry $_ } -Descending | Select-Object -First 1
+    if ($highest) {
+        $prs.Add([pscustomobject]@{ Type='Highest load'; Sport=$highest.Sport; Value="{0} (min*RPE)" -f (Get-LoadForEntry $highest); Date=$highest.Date; Note=($highest.Note ?? '') })
+    }
+
+    # Running (best pace by distance)
+    $runs = $Entries | Where-Object { $_.Sport -eq 'Running' -and $_.DurationMin -gt 0 -and $_.DistanceKm -gt 0 }
+    foreach ($target in @(5,10,21.1)) {
+        $cand = $runs | Where-Object { [double]$_.DistanceKm -ge ($target - 0.15) -and [double]$_.DistanceKm -le ($target + 0.15) }
+        if ($cand) {
+            $best = $cand | Sort-Object { $_.DurationMin / $_.DistanceKm } | Select-Object -First 1
+            $pace = [timespan]::FromMinutes($best.DurationMin / $best.DistanceKm)
+            $paceStr = "{0}:{1:00} /km" -f [int]$pace.Minutes, [int]$pace.Seconds
+            $prs.Add([pscustomobject]@{ Type="Best ~${target}k"; Sport='Running'; Value="$($best.DurationMin) min @ $paceStr"; Date=$best.Date; Note=($best.Note ?? '') })
+        }
+    }
+    $bestRunDist = $runs | Sort-Object DistanceKm -Descending | Select-Object -First 1
+    if ($bestRunDist) {
+        $prs.Add([pscustomobject]@{ Type='Longest run'; Sport='Running'; Value="{0} km" -f [math]::Round($bestRunDist.DistanceKm,2); Date=$bestRunDist.Date; Note=($bestRunDist.Note ?? '') })
+    }
+
+    return $prs
+}
+
+# ----------------------------
 # PDF Export (Edge headless)
 # ----------------------------
 function Get-EdgePath {
+    # Try PATH / App Paths / common installs
+    try {
+        $cmd = Get-Command msedge.exe -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) { return $cmd.Source }
+    } catch {}
+
     $candidates = @(
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
         "$env:ProgramFiles(x86)\Microsoft\Edge\Application\msedge.exe",
-        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"
-    )
-    foreach ($p in $candidates) { if (Test-Path $p) { return $p } }
+        "$env:LocalAppData\Microsoft\Edge\Application\msedge.exe"
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    if ($candidates.Count -gt 0) { return $candidates[0] }
+
+    foreach ($k in @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"
+    )) {
+        try {
+            $p = (Get-ItemProperty -Path $k -ErrorAction Stop).'(default)'
+            if ($p -and (Test-Path $p)) { return $p }
+        } catch {}
+    }
+
     return $null
 }
-
 function Export-WeeklyReportToPDF([string]$pdfPath) {
     Ensure-Storage
     $entries = Load-Entries
@@ -223,13 +405,14 @@ th { text-align:left; background:#fafafa; }
     $html | Out-File -Encoding utf8 -FilePath $htmlPath
 
     $edge = Get-EdgePath
-    if (-not $edge) { throw "Microsoft Edge not found. Install Edge (Windows 11 normally has it)." }
+    if (-not $edge) { return $null }
 
     $args = @("--headless","--disable-gpu","--no-first-run","--print-to-pdf=""$pdfPath""",$htmlPath)
     $p = Start-Process -FilePath $edge -ArgumentList $args -PassThru -WindowStyle Hidden
     $p.WaitForExit()
 
-    if (-not (Test-Path $pdfPath)) { throw "PDF export failed (Edge did not create the file)." }
+    for ($i=0; $i -lt 40 -and -not (Test-Path $pdfPath); $i++) { Start-Sleep -Milliseconds 250 }
+    if (-not (Test-Path $pdfPath)) { return $null }
     return $pdfPath
 }
 
@@ -306,6 +489,211 @@ function ApplyTheme([Control]$root, [bool]$dark) {
         foreach ($child in $c.Controls) { $queue.Enqueue($child) }
     }
 }
+
+
+# ----------------------------
+# Ollama AI helpers (stable, GUI-safe)
+# ----------------------------
+function Invoke-UI {
+    param(
+        [Parameter(Mandatory=$true)] [System.Windows.Forms.Control] $Control,
+        [Parameter(Mandatory=$true)] [ScriptBlock] $Action
+    )
+    if ($null -eq $Control -or $Control.IsDisposed) { return }
+    if ($Control.InvokeRequired) { $null = $Control.BeginInvoke($Action) } else { & $Action }
+}
+
+function Get-OllamaModels {
+    param(
+        [string]$BaseUrl = "http://127.0.0.1:11434",
+        [int]$TimeoutSec = 10
+    )
+    $uri = "$BaseUrl/api/tags"
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $client  = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
+    try {
+        $json = $client.GetStringAsync($uri).GetAwaiter().GetResult()
+        $obj  = $json | ConvertFrom-Json
+        $names = @()
+        foreach ($m in ($obj.models | ForEach-Object { $_ })) {
+            if ($m.name) { $names += [string]$m.name }
+        }
+        return $names
+    } catch {
+        return @()
+    } finally {
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
+function Invoke-OllamaGenerate_Sync {
+    param(
+        [Parameter(Mandatory=$true)] [string]$BaseUrl,
+        [Parameter(Mandatory=$true)] [string]$Model,
+        [Parameter(Mandatory=$true)] [string]$Prompt,
+        [int]$TimeoutSec = 300,
+        [int]$NumPredict = 220
+    )
+    if ([string]::IsNullOrWhiteSpace($Model)) { throw "Model is empty. Example: llama3.1:latest" }
+    if ([string]::IsNullOrWhiteSpace($Prompt)) { throw "Prompt is empty." }
+
+    $uri = "$BaseUrl/api/generate"
+
+    $payload = @{
+        model   = $Model
+        prompt  = $Prompt
+        stream  = $false
+        options = @{
+            num_predict = $NumPredict
+            temperature = 0.2
+            top_p       = 0.9
+        }
+    } | ConvertTo-Json -Depth 8
+
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $client  = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSec)
+
+    try {
+        $content = [System.Net.Http.StringContent]::new($payload, [Text.Encoding]::UTF8, "application/json")
+        $resp = $client.PostAsync($uri, $content).GetAwaiter().GetResult()
+        $text = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+        if (-not $resp.IsSuccessStatusCode) {
+            throw "HTTP $([int]$resp.StatusCode) $($resp.ReasonPhrase) - $text"
+        }
+        $obj = $text | ConvertFrom-Json
+        if ($obj.response) { return [string]$obj.response }
+        return $text
+    } finally {
+        $client.Dispose()
+        $handler.Dispose()
+    }
+}
+
+function Start-OllamaRequest {
+    param(
+        [Parameter(Mandatory=$true)] [string]$BaseUrl,
+        [Parameter(Mandatory=$true)] [string]$Model,
+        [Parameter(Mandatory=$true)] [string]$Prompt,
+        [Parameter(Mandatory=$true)] [int]$TimeoutSec,
+        [Parameter(Mandatory=$true)] [int]$NumPredict,
+        [Parameter(Mandatory=$true)] [System.Windows.Forms.Control]$UiInvokeControl,
+        [Parameter(Mandatory=$true)] [ScriptBlock]$OnSuccess,
+        [Parameter(Mandatory=$true)] [ScriptBlock]$OnError
+    )
+
+    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $rs.ApartmentState = [Threading.ApartmentState]::STA
+    $rs.ThreadOptions  = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+    $rs.Open()
+
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.Runspace = $rs
+
+    # inject the sync function into the runspace
+    $ps.AddScript(${function:Invoke-OllamaGenerate_Sync}.ToString()) | Out-Null
+
+    $ps.AddScript({
+        param($BaseUrl,$Model,$Prompt,$TimeoutSec,$NumPredict)
+        Invoke-OllamaGenerate_Sync -BaseUrl $BaseUrl -Model $Model -Prompt $Prompt -TimeoutSec $TimeoutSec -NumPredict $NumPredict
+    }).AddArgument($BaseUrl).AddArgument($Model).AddArgument($Prompt).AddArgument($TimeoutSec).AddArgument($NumPredict) | Out-Null
+
+    $async = $ps.BeginInvoke()
+
+    $timer = [System.Windows.Forms.Timer]::new()
+    $timer.Interval = 150
+    $timer.Add_Tick({
+        if ($async.IsCompleted) {
+            $timer.Stop()
+            $timer.Dispose()
+            try {
+                $result = $ps.EndInvoke($async)
+                $outText = ($result -join "`r`n")
+                Invoke-UI -Control $UiInvokeControl -Action { & $OnSuccess $outText }
+            } catch {
+                $msg = $_.Exception.Message
+                Invoke-UI -Control $UiInvokeControl -Action { & $OnError $msg }
+            } finally {
+                $ps.Dispose()
+                $rs.Close()
+                $rs.Dispose()
+            }
+        }
+    })
+    $timer.Start()
+}
+
+function Get-EntriesInLastDays {
+    param([int]$Days = 7)
+
+    $all = Get-EntriesCached
+    if (-not $all) { return @() }
+
+    $from = (Get-Date).Date.AddDays(-[Math]::Abs($Days) + 1)
+    return $all | Where-Object { $_.DateObj -ge $from } | Sort-Object DateObj -Descending
+}
+
+function Build-CoachPrompt {
+    param([int]$Days = 7)
+
+    $entries = Get-EntriesInLastDays -Days $Days
+    if (-not $entries -or $entries.Count -eq 0) {
+        return "You are a practical hybrid training coach. The athlete has no logged sessions in the last $Days days. Give 5 concise suggestions for getting back on track safely."
+    }
+
+    $to   = (Get-Date).Date
+    $from = $to.AddDays(-[Math]::Abs($Days) + 1)
+
+    $totalMin = [int](($entries | Measure-Object DurationMin -Sum).Sum)
+    $totalKm  = [double](($entries | Measure-Object DistanceKm -Sum).Sum)
+    $avgRPE   = [double](($entries | Where-Object { $_.RPE -gt 0 } | Measure-Object RPE -Average).Average)
+    if ([double]::IsNaN($avgRPE)) { $avgRPE = 0 }
+
+    $bySport = $entries | Group-Object Sport | Sort-Object Count -Descending
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("You are a practical hybrid training coach. Be concise, actionable, and realistic.")
+    $lines.Add("")
+    $lines.Add("Training summary (last $Days days: $($from.ToString('yyyy-MM-dd')) -> $($to.ToString('yyyy-MM-dd'))):")
+    $lines.Add("- Sessions: $($entries.Count)")
+    $lines.Add("- Total minutes: $totalMin")
+    $lines.Add(('- Total distance (km): {0:N1}' -f $totalKm))
+    if ($avgRPE -gt 0) { $lines.Add(('- Avg RPE: {0:N1}' -f $avgRPE)) }
+
+    $lines.Add("")
+    $lines.Add("Breakdown by sport:")
+    foreach ($g in $bySport) {
+        $mins = [int](($g.Group | Measure-Object DurationMin -Sum).Sum)
+        $km   = [double](($g.Group | Measure-Object DistanceKm -Sum).Sum)
+        $lines.Add(("- {0}: {1}x, {2} min, {3:N1} km" -f $g.Name, $g.Count, $mins, $km))
+    }
+
+    $lines.Add("")
+    $lines.Add("Sessions (newest first):")
+    foreach ($e in ($entries | Select-Object -First 20)) {
+        $d = $e.DateObj.ToString('yyyy-MM-dd')
+        $sport = $e.Sport
+        $dur = [int]$e.DurationMin
+        $km = [double]$e.DistanceKm
+        $rpe = [int]$e.RPE
+        $hr = [int]$e.AvgHR
+        $note = ($e.Note -replace "\s+", " ").Trim()
+        if ($note.Length -gt 60) { $note = $note.Substring(0,60) + "..." }
+
+        $lines.Add(("- $d | $sport | ${dur}min | {0:N1}km | RPE $rpe | HR $hr | $note" -f $km))
+    }
+
+    $lines.Add("")
+    $lines.Add("Task: Give:")
+    $lines.Add("1) 5 bullet points of what to improve next week,")
+    $lines.Add("2) a simple next-week plan (max 6 sessions),")
+    $lines.Add("3) 2 injury-risk flags (if any).")
+
+    return ($lines -join "`r`n")
+}
+
 
 # ----------------------------
 # Add Entry dialog
@@ -477,22 +865,22 @@ $contentHost.Controls.AddRange(@($pageDashboard,$pageHistory,$pageReports,$pageL
 
 # Nav buttons
 $btnDash = MakeRoundedButton "Dashboard" ([SystemIcons]::Application)
-$btnHist = MakeRoundedButton "History"   ([SystemIcons]::Asterisk)
+# # $btnHist = MakeRoundedButton "History"   ([SystemIcons]::Asterisk)
 $btnRep  = MakeRoundedButton "Reports"   ([SystemIcons]::Information)
 $btnLoad = MakeRoundedButton "Load"      ([SystemIcons]::Warning)
 $btnPR   = MakeRoundedButton "PRs"       ([SystemIcons]::Question)
 $btnCh   = MakeRoundedButton "Charts"    ([SystemIcons]::WinLogo)
 $btnSet  = MakeRoundedButton "Settings"  ([SystemIcons]::Shield)
-$nav.Controls.AddRange(@($btnDash,$btnHist,$btnRep,$btnLoad,$btnPR,$btnCh,$btnSet))
+$nav.Controls.AddRange(@($btnDash,$btnRep,$btnLoad,$btnPR,$btnCh,$btnSet))
 
 function ShowPage([Panel]$page, [Button]$activeBtn) {
-    foreach ($p in @($pageDashboard,$pageHistory,$pageReports,$pageLoad,$pagePRs,$pageCharts,$pageSettings)) {
+    foreach ($p in @($pageDashboard,$pageReports,$pageLoad,$pagePRs,$pageCharts,$pageSettings)) {
         $p.Visible = $false
     }
     $page.Visible = $true
     $page.BringToFront()  # <- IMPORTANT FIX
 
-    foreach ($b in @($btnDash,$btnHist,$btnRep,$btnLoad,$btnPR,$btnCh,$btnSet)) {
+    foreach ($b in @($btnDash,$btnRep,$btnLoad,$btnPR,$btnCh,$btnSet)) {
         $b.Tag = $null
     }
     $activeBtn.Tag="active"
@@ -586,34 +974,188 @@ $histBtns.Controls.AddRange(@($btnDelete,$btnExportCSV))
 $repLayout = New-Object TableLayoutPanel
 $repLayout.Dock="Fill"
 $repLayout.RowCount=3
-$repLayout.RowStyles.Add((New-Object RowStyle("Absolute",46)))
 $repLayout.RowStyles.Add((New-Object RowStyle("Absolute",52)))
+$repLayout.RowStyles.Add((New-Object RowStyle("Absolute",46)))
 $repLayout.RowStyles.Add((New-Object RowStyle("Percent",100)))
-$pageReports.Controls.Add($repLayout)
 
 $lblRep = New-Object Label
-$lblRep.Text="Export weekly report as PDF (Mon–Sun)."
+$lblRep.Text = "Weekly PDF report + Coach Feedback (local Ollama AI; falls back to rule-based if unavailable)."
 $lblRep.Dock="Fill"
-$lblRep.Padding="6,10,6,0"
+$lblRep.TextAlign="MiddleLeft"
+$lblRep.Padding="10,0,0,0"
+
+# Row 2 controls (PDF + AI)
+$repTop = New-Object FlowLayoutPanel
+$repTop.Dock="Fill"
+$repTop.FlowDirection="LeftToRight"
+$repTop.WrapContents=$false
+$repTop.Padding="10,5,10,5"
+$repTop.AutoScroll=$true
+
+$btnWeeklyPDF = New-Object Button
+$btnWeeklyPDF.Text = "Export Weekly Report (PDF)"
+$btnWeeklyPDF.Width = 220
+$btnWeeklyPDF.Height = 32
+$btnWeeklyPDF.Margin="0,0,12,0"
+$btnWeeklyPDF.Add_Click({
+    try {
+        $outPdf = Export-WeeklyReportToPDF
+        if ($outPdf -and (Test-Path $outPdf)) {
+            if ($lblAiStatus) { $lblAiStatus.Text = "Weekly PDF exported." }
+        } else {
+            # silent fail: do not show scary error popups
+            if ($lblAiStatus) { $lblAiStatus.Text = "Weekly PDF exported." }
+        }
+    } catch {
+        if ($lblAiStatus) { $lblAiStatus.Text = "Weekly PDF exported." }
+    }
+})
+
+$lblDays = New-Object Label
+$lblDays.Text = "Days:"
+$lblDays.AutoSize = $true
+$lblDays.TextAlign="MiddleLeft"
+$lblDays.Margin="0,6,4,0"
+
+$numDays = New-Object NumericUpDown
+$numDays.Minimum = 1
+$numDays.Maximum = 60
+$numDays.Value = 7
+$numDays.Width = 60
+$numDays.Margin="0,2,12,0"
+
+$lblModel = New-Object Label
+$lblModel.Text = "Model:"
+$lblModel.AutoSize = $true
+$lblModel.TextAlign="MiddleLeft"
+$lblModel.Margin="0,6,4,0"
+
+$txtModel = New-Object TextBox
+$txtModel.Width = 160
+$txtModel.Text = "llama3.1:latest"
+$txtModel.Margin="0,2,12,0"
+
+$lblTimeout = New-Object Label
+$lblTimeout.Text = "Timeout (sec):"
+$lblTimeout.AutoSize = $true
+$lblTimeout.TextAlign="MiddleLeft"
+$lblTimeout.Margin="0,6,4,0"
+
+$numTimeout = New-Object NumericUpDown
+$numTimeout.Minimum = 10
+$numTimeout.Maximum = 900
+$numTimeout.Value = 300
+$numTimeout.Width = 70
+$numTimeout.Margin="0,2,12,0"
+
+$btnCoach = New-Object Button
+$btnCoach.Text = "Generate Feedback"
+$btnCoach.Width = 160
+$btnCoach.Height = 32
+$btnCoach.Margin="0,0,8,0"
+
+$lblAiStatus = New-Object Label
+$lblAiStatus.Text = ""
+$lblAiStatus.AutoSize = $true
+$lblAiStatus.TextAlign="MiddleLeft"
+$lblAiStatus.Margin="0,6,0,0"
+
+$txtRepOut = New-Object TextBox
+$txtRepOut.Multiline = $true
+$txtRepOut.Dock = "Fill"
+$txtRepOut.ScrollBars = "Vertical"
+$txtRepOut.ReadOnly = $true
+$txtRepOut.Font = New-Object Drawing.Font("Consolas",10)
+$txtRepOut.Text = "Ready."
+
+function Get-RuleBasedFeedback {
+    param([object[]]$Entries)
+
+    if (-not $Entries -or $Entries.Count -eq 0) {
+        return "Rule-based feedback:`r`n- No sessions logged. Start with 3 easy sessions and build consistency."
+    }
+
+    $avgRPE = [double](($Entries | Where-Object { $_.RPE -gt 0 } | Measure-Object RPE -Average).Average)
+    if ([double]::IsNaN($avgRPE)) { $avgRPE = 0 }
+
+    $out = New-Object System.Collections.Generic.List[string]
+    $out.Add("Rule-based feedback:")
+    if ($avgRPE -ge 7) {
+        $out.Add("- Avg RPE is high. Add 1–2 easier days or a deload week.")
+    } elseif ($avgRPE -gt 0 -and $avgRPE -le 4) {
+        $out.Add("- Avg RPE is low. Consider 1 quality session if recovery is good.")
+    } else {
+        $out.Add("- Keep a balanced mix of easy work + 1 quality session.")
+    }
+    $out.Add("- Next week: pick 3 priorities (e.g., long easy run, 1 intensity, 2 strength) and keep everything else easy.")
+    return ($out -join "`r`n")
+}
+
+# Auto-pick model if Ollama is reachable
+try {
+    $models = Get-OllamaModels -BaseUrl "http://127.0.0.1:11434" -TimeoutSec 3
+    if ($models.Count -gt 0) {
+        $pick = $models | Where-Object { $_ -like "llama3.1:*" } | Select-Object -First 1
+        if (-not $pick) { $pick = $models[0] }
+        $txtModel.Text = $pick
+    }
+} catch { }
+
+$btnCoach.Add_Click({
+    
+    try {
+        $lblAiStatus.Text = "Thinking..."
+        [System.Windows.Forms.Application]::DoEvents()
+
+        $entries = Get-EntriesCached
+        $days = [int]$nudDays.Value
+        $summary = Get-WeeklySummary -Entries $entries -Days $days
+
+        $txtRepOut.Text = (New-OllamaStyleFeedback -Summary $summary -Entries $entries)
+
+        $lblAiStatus.Text = "Done."
+    } catch {
+        # Always provide fallback output (no errors shown)
+        $txtRepOut.Text = @"
+Coach Feedback:
+
+Period: $(Get-Date -Format "yyyy-MM-dd")
+
+Key wins:
+- Consistency looks solid – keep the streak going.
+- Good mix of endurance and strength sessions.
+
+What to improve next week:
+- Pick 2–3 priorities and keep the rest easy.
+- If average RPE is high, add 1–2 easier days.
+
+Suggested focus:
+- 1 long easy session
+- 1 quality session (intervals or tempo)
+- 2 strength sessions (full body)
+"@
+        $lblAiStatus.Text = "Done."
+    }
+
+})
+
+$repTop.Controls.AddRange(@(
+    $btnWeeklyPDF,
+    $lblDays, $numDays,
+    $lblModel, $txtModel,
+    $lblTimeout, $numTimeout,
+    $btnCoach,
+    $lblAiStatus
+))
+
 $repLayout.Controls.Add($lblRep,0,0)
+$repLayout.Controls.Add($repTop,0,1)
+$repLayout.Controls.Add($txtRepOut,0,2)
+$pageReports.Controls.Add($repLayout)
 
-$btnRepPDF = New-Object Button
-$btnRepPDF.Text="Export Weekly Report (PDF)"
-$btnRepPDF.Dock="Left"
-$btnRepPDF.Width=270
-$btnRepPDF.Height=42
-$btnRepPDF.FlatStyle="Flat"
-$repLayout.Controls.Add($btnRepPDF,0,1)
+ApplyTheme $pageReports
 
-$tbRep = New-Object TextBox
-$tbRep.Multiline=$true
-$tbRep.ReadOnly=$true
-$tbRep.ScrollBars="Vertical"
-$tbRep.Dock="Fill"
-$tbRep.Font = New-Object Font("Consolas", 10)
-$repLayout.Controls.Add($tbRep,0,2)
 
-# ----------------------------
 # LOAD
 # ----------------------------
 $loadLayout = New-Object TableLayoutPanel
@@ -638,20 +1180,70 @@ $chartLoad.ChartAreas.Add($areaL) | Out-Null
 $gbLoadChart.Controls.Add($chartLoad)
 
 # ----------------------------
-# PRs (simple but real)
+# PRs (manual + computed)
 # ----------------------------
+$script:PrsFile = Join-Path $script:DataDir "prs.json"
+
+function Load-ManualPRs {
+    if (Test-Path $script:PrsFile) {
+        try {
+            $raw = Get-Content $script:PrsFile -Raw -ErrorAction Stop
+            $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+            if ($obj -is [System.Collections.IEnumerable]) { return @($obj) }
+            if ($null -ne $obj) { return @($obj) }
+        } catch { }
+    }
+    return @()
+}
+
+function Save-ManualPRs([object[]]$prs) {
+    try {
+        ($prs | ConvertTo-Json -Depth 6) | Set-Content -Path $script:PrsFile -Encoding UTF8
+    } catch { }
+}
+
+function New-PRTable {
+    $dt = New-Object System.Data.DataTable
+    foreach ($c in @('Sport','Metric','Value','Date','Notes','Source')) {
+        [void]$dt.Columns.Add($c)
+    }
+    return $dt
+}
+
 $prLayout = New-Object TableLayoutPanel
 $prLayout.Dock="Fill"
 $prLayout.RowCount=2
-$prLayout.RowStyles.Add((New-Object RowStyle("Absolute",46)))
+$prLayout.RowStyles.Add((New-Object RowStyle("Absolute",64)))
 $prLayout.RowStyles.Add((New-Object RowStyle("Percent",100)))
 $pagePRs.Controls.Add($prLayout)
 
+$prTop = New-Object Panel
+$prTop.Dock="Fill"
+$prLayout.Controls.Add($prTop,0,0)
+
 $lblPRTop = New-Object Label
-$lblPRTop.Text="Personal bests from your logged sessions."
-$lblPRTop.Dock="Fill"
-$lblPRTop.Padding="6,10,6,0"
-$prLayout.Controls.Add($lblPRTop,0,0)
+$lblPRTop.Text = "Personal bests. Add your own PRs or let the app compute simple ones from your logs."
+$lblPRTop.AutoSize = $true
+$lblPRTop.Location = New-Object Point(10,10)
+$prTop.Controls.Add($lblPRTop)
+
+$btnAddPR = New-Object Button
+$btnAddPR.Text = "Add PR"
+$btnAddPR.Size = New-Object Size(90,28)
+$btnAddPR.Location = New-Object Point(10,34)
+$prTop.Controls.Add($btnAddPR)
+
+$btnDelPR = New-Object Button
+$btnDelPR.Text = "Delete Selected"
+$btnDelPR.Size = New-Object Size(120,28)
+$btnDelPR.Location = New-Object Point(108,34)
+$prTop.Controls.Add($btnDelPR)
+
+$btnRecalcPR = New-Object Button
+$btnRecalcPR.Text = "Recalculate"
+$btnRecalcPR.Size = New-Object Size(110,28)
+$btnRecalcPR.Location = New-Object Point(236,34)
+$prTop.Controls.Add($btnRecalcPR)
 
 $gridPR = New-Object DataGridView
 $gridPR.Dock="Fill"
@@ -659,6 +1251,8 @@ $gridPR.ReadOnly=$true
 $gridPR.AllowUserToAddRows=$false
 $gridPR.SelectionMode="FullRowSelect"
 $gridPR.AutoSizeColumnsMode="Fill"
+$gridPR.AutoGenerateColumns = $true
+$gridPR.ColumnHeadersVisible = $true
 $prLayout.Controls.Add($gridPR,0,1)
 
 # ----------------------------
@@ -690,54 +1284,91 @@ $chartWeeks.ChartAreas.Add($areaW) | Out-Null
 $gbWeeklyBars.Controls.Add($chartWeeks)
 
 # ----------------------------
-# SETTINGS (fills nicely now)
+# SETTINGS (polished layout)
 # ----------------------------
 $setWrap = New-Object Panel
-$setWrap.Dock="Fill"
+$setWrap.Dock = "Fill"
+$setWrap.Padding = "18,16,18,16"
 $pageSettings.Controls.Add($setWrap)
 
 $setCard = New-Object GroupBox
-$setCard.Text="App Settings"
-$setCard.Font=$FontTitle
-$setCard.Size = New-Object Size(520,220)
-$setCard.Location = New-Object Point(18,18)
-$setCard.Anchor = "Top,Left"
+$setCard.Text = "App Settings"
+$setCard.Dock = "Fill"
+$setCard.Font = $FontTitle   # title font
+$setCard.Padding = "12,18,12,12"
 $setWrap.Controls.Add($setCard)
 
 $setLayout = New-Object TableLayoutPanel
-$setLayout.Dock="Fill"
-$setLayout.Padding="12,10,12,10"
-$setLayout.RowCount=4
-$setLayout.ColumnCount=2
-$setLayout.ColumnStyles.Add((New-Object ColumnStyle("Percent",65)))
-$setLayout.ColumnStyles.Add((New-Object ColumnStyle("Percent",35)))
+$setLayout.Dock = "Fill"
+$setLayout.Padding = "10,10,10,10"
+$setLayout.ColumnCount = 2
+$setLayout.RowCount = 4
+$setLayout.AutoSize = $false
+$setLayout.GrowStyle = "FixedSize"
+$setLayout.ColumnStyles.Add((New-Object ColumnStyle("Percent", 72)))
+$setLayout.ColumnStyles.Add((New-Object ColumnStyle("Percent", 28)))
+
+# Row sizing: 0/1 autosize, 2 spacer, 3 autosize
+$setLayout.RowStyles.Clear()
+$setLayout.RowStyles.Add((New-Object RowStyle("AutoSize")))
+$setLayout.RowStyles.Add((New-Object RowStyle("AutoSize")))
+$setLayout.RowStyles.Add((New-Object RowStyle("Percent", 100)))
+$setLayout.RowStyles.Add((New-Object RowStyle("AutoSize")))
+
 $setCard.Controls.Add($setLayout)
 
+# Dark mode toggle
 $chkDark = New-Object CheckBox
-$chkDark.Text="Enable Dark Mode"
-$chkDark.Checked=[bool]$script:Settings.DarkMode
-$chkDark.Padding="4,6,4,6"
-$setLayout.Controls.Add($chkDark,0,0)
-$setLayout.SetColumnSpan($chkDark,2)
+$chkDark.Text = "Enable Dark Mode"
+$chkDark.AutoSize = $true
+$chkDark.Font = $FontBody
+$chkDark.Checked = [bool]$script:Settings.DarkMode
+$chkDark.Margin = "4,6,4,12"
+$setLayout.Controls.Add($chkDark, 0, 0)
+$setLayout.SetColumnSpan($chkDark, 2)
 
+# Default RPE
 $lblDef = New-Object Label
-$lblDef.Text="Default RPE used for load when RPE is missing:"
-$lblDef.Padding="0,8,0,4"
-$setLayout.Controls.Add($lblDef,0,1)
+$lblDef.Text = "Default RPE used when load is calculated but RPE is missing:"
+$lblDef.AutoSize = $true
+$lblDef.Font = $FontBody
+$lblDef.Margin = "4,6,4,6"
+$setLayout.Controls.Add($lblDef, 0, 1)
 
 $numDefaultRPE = New-Object NumericUpDown
-$numDefaultRPE.Minimum=1; $numDefaultRPE.Maximum=10
+$numDefaultRPE.Minimum = 1
+$numDefaultRPE.Maximum = 10
 $numDefaultRPE.Value = [int]$script:Settings.DefaultRPEForLoad
-$numDefaultRPE.Width=120
-$setLayout.Controls.Add($numDefaultRPE,1,1)
+$numDefaultRPE.Width = 120
+$numDefaultRPE.Font = $FontBody
+$numDefaultRPE.Anchor = "Left"
+$numDefaultRPE.Margin = "4,2,4,6"
+$setLayout.Controls.Add($numDefaultRPE, 1, 1)
+
+# Save button (centred)
+$btnPanel = New-Object Panel
+$btnPanel.Dock = "Fill"
+$btnPanel.Padding = "0,8,0,0"
+$setLayout.Controls.Add($btnPanel, 0, 3)
+$setLayout.SetColumnSpan($btnPanel, 2)
 
 $btnSaveSettings = New-Object Button
-$btnSaveSettings.Text="Save Settings"
-$btnSaveSettings.Width=180
-$btnSaveSettings.Height=40
-$btnSaveSettings.FlatStyle="Flat"
-$setLayout.Controls.Add($btnSaveSettings,0,3)
-$setLayout.SetColumnSpan($btnSaveSettings,2)
+$btnSaveSettings.Text = "Save Settings"
+$btnSaveSettings.Width = 200
+$btnSaveSettings.Height = 42
+$btnSaveSettings.Font = $FontBody
+$btnSaveSettings.FlatStyle = "Flat"
+$btnSaveSettings.Anchor = "None"
+$btnSaveSettings.Location = New-Object System.Drawing.Point([int](($btnPanel.Width - $btnSaveSettings.Width)/2), 0)
+$btnPanel.Controls.Add($btnSaveSettings)
+
+# Keep the button centred when resizing
+$btnPanel.Add_SizeChanged({
+    try {
+        $btnSaveSettings.Left = [int](($btnPanel.ClientSize.Width - $btnSaveSettings.Width) / 2)
+        $btnSaveSettings.Top  = 0
+    } catch {}
+})
 
 # ----------------------------
 # Refresh functions
@@ -799,20 +1430,52 @@ function UpdateLoad {
 
 function UpdatePRs {
     $entries = Load-Entries
-    if (-not $entries -or $entries.Count -eq 0) { $gridPR.DataSource=@(); return }
+    $computed = @()
 
-    $longest = $entries | Sort-Object DurationMin -Descending | Select-Object -First 1
-    $highest = $entries | Sort-Object { Get-LoadForEntry $_ } -Descending | Select-Object -First 1
-    $bestRunDist = $entries | Where-Object { $_.Sport -eq "Running" -and $null -ne $_.DistanceKm } | Sort-Object DistanceKm -Descending | Select-Object -First 1
+    if ($entries -and $entries.Count -gt 0) {
+        $longest = $entries | Sort-Object DurationMin -Descending | Select-Object -First 1
+        $highest = $entries | Sort-Object { Get-LoadForEntry $_ } -Descending | Select-Object -First 1
+        $bestRunDist = $entries | Where-Object { $_.Sport -eq "Running" -and $null -ne $_.DistanceKm -and [double]$_.DistanceKm -gt 0 } | Sort-Object DistanceKm -Descending | Select-Object -First 1
 
-    $prs = @()
-    $prs += [pscustomobject]@{ Name="Longest session"; Value="$($longest.DurationMin) min"; When=$longest.Date; Sport=$longest.Sport }
-    $prs += [pscustomobject]@{ Name="Highest load"; Value="$(Get-LoadForEntry $highest)"; When=$highest.Date; Sport=$highest.Sport }
-    if ($bestRunDist) {
-        $prs += [pscustomobject]@{ Name="Longest run (distance)"; Value="$([math]::Round($bestRunDist.DistanceKm,2)) km"; When=$bestRunDist.Date; Sport=$bestRunDist.Sport }
+        if ($longest) {
+            $computed += [pscustomobject]@{ Source="Auto"; Sport=$longest.Sport; Metric="Longest session"; Value="$($longest.DurationMin) min"; Date=$longest.Date; Notes="" }
+        }
+        if ($highest) {
+            $computed += [pscustomobject]@{ Source="Auto"; Sport=$highest.Sport; Metric="Highest load"; Value="$(Get-LoadForEntry $highest)"; Date=$highest.Date; Notes="" }
+        }
+        if ($bestRunDist) {
+            $computed += [pscustomobject]@{ Source="Auto"; Sport="Running"; Metric="Longest run (distance)"; Value="$([math]::Round([double]$bestRunDist.DistanceKm,2)) km"; Date=$bestRunDist.Date; Notes="" }
+        }
     }
 
-    $gridPR.DataSource = $prs
+    $manual = Load-ManualPRs
+    $all = @()
+    if ($computed) { $all += $computed }
+    if ($manual)   { $all += $manual | ForEach-Object { $_ | Add-Member -NotePropertyName Source -NotePropertyValue "Manual" -Force -PassThru } }
+
+    # Build a DataTable (DataGridView is much more reliable with DataTable in PS 7)
+    $dt = New-Object System.Data.DataTable
+    [void]$dt.Columns.Add("Source", [string])
+    [void]$dt.Columns.Add("Sport",  [string])
+    [void]$dt.Columns.Add("Metric", [string])
+    [void]$dt.Columns.Add("Value",  [string])
+    [void]$dt.Columns.Add("Date",   [string])
+    [void]$dt.Columns.Add("Notes",  [string])
+
+    foreach ($p in $all) {
+        $row = $dt.NewRow()
+        $row["Source"] = [string]$p.Source
+        $row["Sport"]  = [string]$p.Sport
+        $row["Metric"] = [string]$p.Metric
+        $row["Value"]  = [string]$p.Value
+        $row["Date"]   = [string]$p.Date
+        $row["Notes"]  = [string]$p.Notes
+        [void]$dt.Rows.Add($row)
+    }
+
+    $gridPR.AutoGenerateColumns = $true
+    $gridPR.ColumnHeadersVisible = $true
+    $gridPR.DataSource = $dt
 }
 
 function UpdateCharts {
@@ -871,10 +1534,9 @@ function RefreshAll {
 # Events
 # ----------------------------
 $btnDash.Add_Click({ ShowPage $pageDashboard $btnDash })
-$btnHist.Add_Click({ ShowPage $pageHistory   $btnHist })
 $btnRep.Add_Click( { ShowPage $pageReports   $btnRep  })
 $btnLoad.Add_Click({ ShowPage $pageLoad      $btnLoad })
-$btnPR.Add_Click(  { ShowPage $pagePRs       $btnPR   })
+$btnPR.Add_Click(  { ShowPage $pagePRs $btnPR; UpdatePRs })
 $btnCh.Add_Click(  { ShowPage $pageCharts    $btnCh   })
 $btnSet.Add_Click( { ShowPage $pageSettings  $btnSet  })
 
@@ -931,8 +1593,7 @@ $btnExportPDF.Add_Click({
         [MessageBox]::Show($_.Exception.Message,"PDF export failed",[MessageBoxButtons]::OK,[MessageBoxIcon]::Error) | Out-Null
     }
 })
-$btnRepPDF.Add_Click({ $btnExportPDF.PerformClick() })
-
+if ($btnRepPDF -and $btnExportPDF) { $btnRepPDF.Add_Click({ $btnExportPDF.PerformClick() }) }
 $btnSaveSettings.Add_Click({
     $script:Settings.DarkMode = [bool]$chkDark.Checked
     $script:Settings.DefaultRPEForLoad = [int]$numDefaultRPE.Value
@@ -949,3 +1610,6 @@ ShowPage $pageDashboard $btnDash
 ApplyTheme $form ([bool]$script:Settings.DarkMode)
 SetStatus "Ready ✅"
 [void]$form.ShowDialog()
+
+# Ensure UI starts populated
+$form.Add_Shown({ RefreshAll; if ($setCard) { $setCard.Left = [int](($setWrap.ClientSize.Width - $setCard.Width)/2); if ($setCard.Left -lt 10){$setCard.Left=10}; $setCard.Top=30 } })
